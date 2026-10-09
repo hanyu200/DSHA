@@ -94,23 +94,49 @@ public final class WebProcSel {
   /**
    * 这条命令行是不是<b>本次 chroot 启动链</b>的某一环。
    *
-   * <p>判据是「形状完全对得上」，不是子串：{@code [前缀命令…] <解释器> <绝对路径>/<已知脚本名>
-   * <已知子命令>}。宁可漏认（退化成「当普通未知进程处理」，那本来也是 fail-closed），
-   * 也不能把用户自己的进程认成启动器。
+   * <p>认两种形状，都是「完全对得上」而不是子串匹配：
+   * <ol>
+   *   <li><b>su 包装</b>（Java 侧实际用的）：
+   *       {@code su -c 'sh "$0" boot' <绝对路径>/<已知脚本名>} ——
+   *       脚本路径是独立 argv，所以路径里的奇怪字符不会影响判定；</li>
+   *   <li><b>直接执行</b>（手工诊断 / 阶段 0.5 用）：
+   *       {@code [unshare|nsenter|setsid…] [选项] <解释器|脚本本身> <已知脚本路径> <已知子命令> [--选项…]}。</li>
+   * </ol>
+   *
+   * <p>其余一律 false —— 宁可漏认（退化成「当普通未知进程处理」，那本来也是 fail-closed），
+   * 也不能把用户自己的进程认成启动器：{@code cat}/{@code vim}/{@code grep} 拿脚本当参数的
+   * 情形都必须排除。
    */
   public static boolean isChrootStarter(String cmdline) {
     if (cmdline == null || cmdline.isEmpty()) return false;
-    String[] argv = splitCmdline(cmdline);
+    return isSuWrappedStarter(splitCmdline(cmdline)) || isDirectStarter(splitCmdline(cmdline));
+  }
+
+  /** {@code su -c 'sh "$0" boot' <脚本路径>}：路径是独立 argv，无需解析引号。 */
+  private static boolean isSuWrappedStarter(String[] argv) {
+    if (argv.length != 4) return false;
+    if (!basename(argv[0]).equals("su")) return false;
+    if (!argv[1].equals("-c")) return false;
+    if (!isChrootLaunchSnippet(argv[2])) return false;
+    return isChrootScriptPath(argv[3]);
+  }
+
+  /** 与 {@code ContainerRuntime.Chroot.GUEST_LAUNCH} 同一条，允许空白差异。 */
+  static boolean isChrootLaunchSnippet(String snippet) {
+    if (snippet == null) return false;
+    return snippet.trim().replaceAll("\\s+", " ").equals("sh \"$0\" boot");
+  }
+
+  /** 直接执行：{@code [前缀命令…] <解释器|脚本> <脚本路径> <子命令> [--选项…]}。 */
+  private static boolean isDirectStarter(String[] argv) {
     int at = 0;
-    // 跳过 unshare / nsenter 这类前置命令及其选项；选项后面还可能再跟一个前置命令。
     while (at < argv.length && isLaunchPrefix(basename(argv[at]))) {
       at++;
       at = skipOptions(argv, at);
     }
     if (at >= argv.length) return false;
     if (!isShell(basename(argv[at]))) {
-      // 允许直接 exec 脚本本身（内核用 shebang 接管），此时脚本必须是可识别的绝对路径，
-      // 且形状要与解释器分支一致。
+      // 允许直接 exec 脚本本身（内核用 shebang 接管），此时形状要与解释器分支一致。
       return isChrootScriptPath(argv[at]) && isStarterTail(argv, at);
     }
     return at + 1 < argv.length && isChrootScriptPath(argv[at + 1]) && isStarterTail(argv, at + 1);
