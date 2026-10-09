@@ -299,4 +299,84 @@ public final class ChrootProbeTest {
     assertEquals(30L * 24 * 60 * 60 * 1000, ChrootProbe.MAX_AGE_MILLIS);
     assertEquals(256 * 1024, ChrootProbe.MAX_REPORT_BYTES);
   }
+
+  // ---------------------------------------------------------------- 真实脚本输出
+
+  /**
+   * 设置页探测脚本（{@code assets/chroot/host-probe.sh}）的实际输出形状。
+   *
+   * <p>这份夹具的价值在于<b>契约</b>：脚本改了键名、App 改了判据，两边任意一侧漂移都会在
+   * 这里断掉 —— 否则症状是「探测永远说 chroot 不可用」，而原因谁也看不出来。
+   */
+  private static final String SCRIPT_OUTPUT =
+      String.join(
+          "\n",
+          "check.root=yes",
+          "exit.root=0",
+          "fact.app_uid=10234",
+          "check.unshare=yes",
+          "check.chroot=yes",
+          "fact.rootfs_present=yes",
+          "fact.rootfs_bash=yes",
+          "fact.rootfs_owner=10234:10234",
+          "check.setpriv=yes",
+          "fact.pid_ns=yes",
+          "fact.tmpfs=yes",
+          "fact.devpts=yes",
+          "fact.selinux_before=u:r:su:s0",
+          "fact.pagesize=4096",
+          "fact.tool_unshare=yes",
+          "fact.tool_chroot=yes",
+          "fact.tool_setpriv=yes",
+          "fact.tool_mount=yes",
+          "fact.tool_umount=yes",
+          "fact.tool_nsenter=no",
+          "fact.writable__root=yes",
+          "fact.writable__root_.dsh=yes",
+          "fact.probe_version=1");
+
+  @Test
+  public void parsesTheProbeScriptOutputEndToEnd() {
+    ChrootProbe.Result result = ChrootProbe.parse(SCRIPT_OUTPUT, NOW);
+    assertTrue(result.readable());
+    assertTrue(ChrootProbe.chrootUsable(result));
+    assertEquals("", result.blocking());
+    assertTrue(ChrootProbe.trusted(result, NOW));
+    assertEquals(RuntimeSelection.CHROOT, ChrootProbe.choose(result, true));
+    // 记录项要能被读到，且不因为缺失而影响结论。
+    assertEquals("u:r:su:s0", result.fact(ChrootProbe.Fact.SELINUX_BEFORE));
+    assertEquals("4096", result.fact(ChrootProbe.Fact.PAGESIZE));
+    assertEquals("yes", result.fact(ChrootProbe.Fact.TMPFS));
+    // 只读探测不做进程回收测试 —— 该项必须缺席，于是 PID ns 保持关闭（计划 §2.2 的暂定值）。
+    assertEquals("", result.fact(ChrootProbe.Fact.PID_NS_RECYCLE));
+    assertTrue(ChrootProbe.pidNamespaceBuildable(result));
+    assertFalse(ChrootProbe.pidNamespaceEnabled(result));
+    // nsenter 缺失不影响 chroot 可用性（不是硬判据）。
+    assertFalse(ChrootProbe.needsBundledToybox(result));
+  }
+
+  @Test
+  public void missingHardCheckMakesTheScriptOutputUnusable() {
+    // 脚本某一行没打出来（例如早期退出）：结论必须是「不可用」，不能乐观默认成通过。
+    for (String key : List.of("check.root", "check.unshare", "check.chroot", "check.setpriv")) {
+      String damaged = SCRIPT_OUTPUT.replace(key + "=yes", key + "=no");
+      ChrootProbe.Result result = ChrootProbe.parse(damaged, NOW);
+      assertFalse(key, ChrootProbe.chrootUsable(result));
+      assertEquals(key.substring("check.".length()), result.blocking());
+      assertEquals(RuntimeSelection.PROROOT, ChrootProbe.choose(result, true));
+      assertTrue(ChrootProbe.needsBundledToybox(result));
+    }
+  }
+
+  @Test
+  public void scriptOutputWithoutSetprivNeverSelectsChroot() {
+    // setpriv 缺 → 只能以 root 跑 dsh → 宿主停止链路失效，属于安全模型倒退，必须拦下。
+    String damaged = SCRIPT_OUTPUT.replace("check.setpriv=yes", "check.setpriv=no");
+    ChrootProbe.Result result = ChrootProbe.parse(damaged, NOW);
+    assertFalse(ChrootProbe.chrootUsable(result));
+    assertTrue(ChrootProbe.needsBundledToybox(result));
+    String text = ChrootProbe.report(result);
+    assertTrue(text.contains("缺项：setpriv"));
+    assertTrue(text.contains("选择：proroot"));
+  }
 }

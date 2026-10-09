@@ -166,7 +166,9 @@ public final class ChrootProbe {
 
   /** 是否需要随包静态 toybox：宿主缺 unshare/chroot/setpriv 任一，就得自带。 */
   public static boolean needsBundledToybox(Result result) {
-    if (result == null || !result.readable()) return true;
+    // 探测结论不可读、或连 root 都没有：一律按「需要」处理。没有 root 时装 toybox 也开不了
+    // chroot，但这里刻意保守 —— 宁可让界面提示一句多余的话，也不能在真缺工具时静默放行。
+    if (result == null || !result.readable() || !result.passed(Check.ROOT)) return true;
     return !result.passed(Check.UNSHARE)
         || !result.passed(Check.CHROOT)
         || !result.passed(Check.SETPRIV);
