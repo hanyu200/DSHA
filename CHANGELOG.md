@@ -1,5 +1,40 @@
 # 更新记录
 
+## 0.2.22-20261009.1200-dsh0.2.0-rc.2 / 171（2026-10-09，chroot 运行时 fork）
+
+本版是 DSHA 的三运行时 fork：在**保留** proot / proroot 两个现有运行时的前提下新增
+**chroot** 运行时，选择顺序为「chroot（有 root 且探测通过）→ proroot → proot」，由能力
+探测决定。实施依据见《DSHA 三运行时 Fork 实施方案》；本机可验证范围内的实现与验证结果
+见[本轮交付报告](docs/chroot-runtime.md)。
+
+- 新增运行时档位与探测：`util/ChrootProbe`（探测结论的结构化记录 + 确定性选择 + 报告
+  解析/导出）、`util/RuntimeSelection`（偏好与探测折算成这一次用谁，含降级阶梯）、
+  `util/RuntimeFallback`（失败归因：只有运行时层签名才允许降级）。三个纯逻辑类均配单测。
+- **选择由探测决定，不由启动失败决定**：无 root 时 chroot 压根不在阶梯里，因此不存在
+  「先起一次 chroot 等它失败」的等待与重试；proot 是链条终点。用户手动强制优先，强制档
+  不可用时按自动结论回落并在诊断里记录原因（不静默降级）。
+- **失败兜底有界**：只有能明确对上运行时层签名（su 拒绝 / 挂载失败 / chroot exec 失败 /
+  内核与装载器错误）的失败才允许本次降一级；端口占用、插件崩溃、dsh 报错、配置错误一律
+  **不降级**，同档重试并报真实错误。
+- **`WebProcSel` 扩展**（既有不变式）：认得出 chroot 引导链（`su -c 'sh "$0" boot'` +
+  脚本绝对路径，或 `unshare/sh + 脚本 + 已知子命令` 的直接执行形状），并明确**不对它发信号**
+  —— 它跑在 root 域，宿主杀不动，杀掉也等于把整个环境一起带走。
+- 新增 `runtime/ChrootHostScripts`（引导脚本按内容摘要落到应用私有目录的只读槽位）、
+  `runtime/ChrootProbeStore`（探测结论落盘与读取，路径与真机冒烟脚本一致）、
+  `runtime/ContainerRuntime.Chroot` 与 `app/src/main/assets/chroot/{host-launch.sh,host-ctl.sh}`。
+- 监护进程**先降回应用 UID 再写 pid 文件**：降权后宿主与它同 UID，仓库既有的「pid 文件 +
+  出生身份核验」停止链路原样可用，不需要 `su -c kill` 那条被明令禁止的路。
+- 设置页运行方式由两选一改为四选一（自动 / 强制 chroot / 强制 proroot / 强制 proot）；
+  历史存盘值 `proroot` / `proot` 仍被原样识别，老用户升级后意图不变。
+- **语义变化**（冷安装）：新增 chroot 后 proroot 不再是唯一的快档，因此冷安装的
+  `preferFastColdModeFrom` 现在把旧默认值 `proot` 与新的 `auto` 同等看待（都表示「用户没
+  要求更快的档」）；`proroot` / `chroot` 与类型损坏的值仍然阻止自动换档。
+- **已知权限差异**：`setpriv` 只改 UID/GID、不改 SELinux 上下文，chroot 内 dsh 会以
+  应用 UID + su 域运行，权限面比上游的 app 域宽；这是如实记录的差异，不宣称「安全隔离」。
+- **未完成/未验证**：PID ns 在 v1 内不实现（见报告说明）；真机链路（chroot 起 Web、
+  原生模块、PTY、备份、运行时双向切换）需在设备上按验收清单执行，本机无法代跑。
+  受管更新（`RuntimeTrial` / 冷安装）仍走 proot，与上游一致。
+
 ## 0.2.7-20261003.1944-dsh0.2.0-rc.2 / 156（2026-10-03，本地修订）
 
 - 重新核对全部236个审计编号，补修旧台账遗漏的凭据导出、特权文件竞态、取消传播、原子记录发布、CI回执和测试夹具问题；逐项事实与实际检查见[本轮交付报告](docs/releases/v0.2.7-build156-20261003.md)。

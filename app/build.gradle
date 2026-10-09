@@ -23,9 +23,10 @@ android {
         minSdk 30
         targetSdk 37
         buildConfigField 'String', 'BUNDLED_PNPM_VERSION', '"' + bundledTools.pnpm.version + '"'
-        versionCode 170
+        // fork 必须递增版本码：同版本码 + 不同签名的包会被设备当成降级/冲突包拒绝覆盖。
+        versionCode 171
         // DSHA 修订号 + 固定的北京时间戳 + 内置 DSH 版本；同一交付重建不变。
-        versionName "0.2.21-20261009.0750-dsh0.2.0-rc.2"
+        versionName "0.2.22-20261009.1200-dsh0.2.0-rc.2"
         testInstrumentationRunner project.findProperty('dsha.testRunner') ?: "com.deepseekharness.app.Rc13Instrumentation"
         ndk {
             abiFilters 'arm64-v8a'
