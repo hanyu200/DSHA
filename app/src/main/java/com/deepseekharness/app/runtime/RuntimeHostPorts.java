@@ -24,15 +24,39 @@ public final class RuntimeHostPorts {
   public static final class Settings {
     public final String dnsMode;
     public final boolean proroot, staticLoader, disableProotSeccomp;
+    /**
+     * 用户偏好：{@code auto} / {@code chroot} / {@code proroot} / {@code proot}。
+     *
+     * <p>与 {@link #proroot} 的分工：{@code proroot} 是历史布尔开关，只在冷安装的
+     * 「已确认成功方式」核验里继续使用；日常选择一律看本字段。历史存盘值
+     * {@code "proroot"} / {@code "proot"} 天然被 {@code RuntimeSelection.Mode.parse} 识别，
+     * 因此老用户升级后意图不变。
+     */
+    public final String runtimeChoice;
 
     public Settings(
         String dnsMode, boolean proroot, boolean staticLoader, boolean disableProotSeccomp) {
+      this(dnsMode, proroot, staticLoader, disableProotSeccomp, proroot ? "proroot" : "auto");
+    }
+
+    public Settings(
+        String dnsMode,
+        boolean proroot,
+        boolean staticLoader,
+        boolean disableProotSeccomp,
+        String runtimeChoice) {
       if (dnsMode == null || !dnsMode.matches("auto|ipv4|native"))
         throw new IllegalArgumentException("RUNTIME_DNS_MODE");
       this.dnsMode = dnsMode;
       this.proroot = proroot;
       this.staticLoader = staticLoader;
       this.disableProotSeccomp = disableProotSeccomp;
+      this.runtimeChoice =
+          com.deepseekharness.app.util.RuntimeSelection.Mode.parse(runtimeChoice).stored();
+    }
+
+    public com.deepseekharness.app.util.RuntimeSelection.Mode mode() {
+      return com.deepseekharness.app.util.RuntimeSelection.Mode.parse(runtimeChoice);
     }
   }
 

@@ -239,4 +239,64 @@ public final class ChrootProbeTest {
     assertTrue(text.contains("缺项：setpriv"));
     assertTrue(text.contains("选择：proroot"));
   }
+
+  // ---------------------------------------------------------------- 结论保鲜
+
+  private static final long NOW = 1_800_000_000_000L;
+
+  private static ChrootProbe.Result at(long millis, boolean readable) {
+    return new ChrootProbe.Result(readable, "", allPassing(), Map.of(), Map.of(), millis);
+  }
+
+  @Test
+  public void freshReadableProbeIsTrusted() {
+    assertTrue(ChrootProbe.trusted(at(NOW, true), NOW));
+    assertTrue(ChrootProbe.trusted(at(NOW - ChrootProbe.MAX_AGE_MILLIS, true), NOW));
+    assertFalse(ChrootProbe.shouldReprobe(at(NOW, true), NOW));
+  }
+
+  @Test
+  public void staleOrTimelessOrFutureProbeIsNotTrusted() {
+    assertFalse(ChrootProbe.trusted(at(NOW - ChrootProbe.MAX_AGE_MILLIS - 1, true), NOW));
+    // 没有时间戳（0）说明来源不明，不能当有效结论。
+    assertFalse(ChrootProbe.trusted(at(0, true), NOW));
+    // 时间戳在未来：时钟被改过或文件被换过，两种都不该信任。
+    assertFalse(ChrootProbe.trusted(at(NOW + 1, true), NOW));
+    // 不可读的结论一律不信任，哪怕时间戳很新。
+    assertFalse(ChrootProbe.trusted(at(NOW, false), NOW));
+    assertFalse(ChrootProbe.trusted(null, NOW));
+  }
+
+  @Test
+  public void shouldReprobeForEveryUntrustedCase() {
+    for (ChrootProbe.Result untrusted :
+        List.of(
+            at(NOW - ChrootProbe.MAX_AGE_MILLIS - 1, true),
+            at(0, true),
+            at(NOW + 60_000, true),
+            at(NOW, false),
+            ChrootProbe.Result.unknown("x", NOW))) {
+      assertTrue(ChrootProbe.shouldReprobe(untrusted, NOW));
+    }
+    assertFalse(ChrootProbe.shouldReprobe(at(NOW - 1000, true), NOW));
+    // 从没跑过（unknown + 无可读内容）必须重跑。
+    assertTrue(ChrootProbe.shouldReprobe(ChrootProbe.parse(null, 0L), NOW));
+  }
+
+  @Test
+  public void trustedTextMatchesParseThenTrusted() {
+    String report = "check.root=yes\ncheck.setpriv=yes";
+    assertTrue(ChrootProbe.trustedText(report, NOW - 1000, NOW));
+    assertFalse(ChrootProbe.trustedText(report, NOW - ChrootProbe.MAX_AGE_MILLIS - 1, NOW));
+    assertFalse(ChrootProbe.trustedText("", NOW, NOW));
+    assertFalse(ChrootProbe.trustedText(null, NOW, NOW));
+    // 报告本身不可读（没有 check./fact. 行）时，时间戳再新也不算可信。
+    assertFalse(ChrootProbe.trustedText("没有键值的一段话", NOW, NOW));
+  }
+
+  @Test
+  public void maxAgeIsThirtyDays() {
+    assertEquals(30L * 24 * 60 * 60 * 1000, ChrootProbe.MAX_AGE_MILLIS);
+    assertEquals(256 * 1024, ChrootProbe.MAX_REPORT_BYTES);
+  }
 }

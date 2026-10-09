@@ -3,8 +3,10 @@ package com.deepseekharness.app.runtime;
 import android.content.Context;
 import android.util.Log;
 import com.deepseekharness.app.util.BoundedProcessRunner;
+import com.deepseekharness.app.util.ChrootProbe;
 import com.deepseekharness.app.util.Compat;
 import com.deepseekharness.app.util.MaintenanceGate;
+import com.deepseekharness.app.util.RuntimeSelection;
 import com.deepseekharness.app.util.RuntimeWorkPort;
 import com.deepseekharness.app.util.SensitiveData;
 import com.deepseekharness.app.util.UiText;
@@ -51,24 +53,94 @@ final class RuntimeExecution {
     hardlinks = new RuntimeHardlinks(context, rootfs, ports);
   }
 
+  /**
+   * 运行时选择的<b>唯一决策点</b>：探测结论 + 用户偏好 + 资产可用性 → 这一次用谁。
+   *
+   * <p>三条不变式，逐条对应实施计划 §2.1：
+   * <ol>
+   *   <li><b>无 root 时不会试 chroot</b>：探测结论不可用时 {@code RuntimeSelection.choose}
+   *       直接给出 proroot/proot，chroot 压根不在阶梯里 —— 因此这里没有「先起一次 chroot
+   *       等它失败」的等待，也没有失败重试。</li>
+   *   <li><b>手动强制优先</b>：用户选了哪一档就用哪一档；该档不可用时按自动结论回落，
+   *       并把原因记进诊断（{@code RUNTIME_CHOICE_UNAVAILABLE}），界面据此显式提示 ——
+   *       计划禁止静默降级。</li>
+   *   <li><b>proot 是终点</b>：任何一档都先确认资产在，再返回；确认失败就继续往下，
+   *       最终一定落到 proot（APK 内置 libproot.so）。</li>
+   * </ol>
+   */
   ContainerRuntime runtime() {
     RuntimeHostPorts.Settings settings = ports.settings();
-    try {
-      if (!forceProot && android.os.Build.VERSION.SDK_INT >= 26 && settings.proroot) {
+    boolean prorootUsable = prorootUsable();
+    ChrootProbe.Result probe = ChrootProbeStore.read(context, System.currentTimeMillis());
+    RuntimeSelection.Decision decision =
+        RuntimeSelection.choose(settings.mode(), probe, prorootUsable);
+    if (decision.overrodeUserChoice())
+      ports.record("RUNTIME_CHOICE_UNAVAILABLE", decision.fallbackReason());
+
+    if (RuntimeSelection.CHROOT.equals(decision.runtime())) {
+      ContainerRuntime chroot = chroot(probe);
+      if (chroot != null) return chroot;
+      // 探测说可用、装配却失败：按同一条规则往下走，并把原因留下。
+      ports.record("RUNTIME_SELECTION_FALLBACK", "chroot-assembly");
+    }
+    if (RuntimeSelection.PROROOT.equals(decision.runtime()) && prorootUsable) {
+      try {
         ContainerRuntime selected =
             new ContainerRuntime.Proroot(
                 context, ContainerRuntime.Proroot.defaultDir(context), settings.staticLoader);
-        if (selected.available()) {
-          selected.prepare();
-          return selected;
-        }
-        ports.record(
-            "RUNTIME_SELECTION_FALLBACK", SensitiveData.redact(selected.unavailableReason()));
+        selected.prepare();
+        return selected;
+      } catch (Exception failure) {
+        ports.record("RUNTIME_SELECTION_FALLBACK", SensitiveData.redact(String.valueOf(failure)));
       }
-    } catch (Exception failure) {
-      ports.record("RUNTIME_SELECTION_FALLBACK", SensitiveData.redact(String.valueOf(failure)));
+    } else if (RuntimeSelection.PROROOT.equals(decision.runtime())) {
+      ports.record("RUNTIME_SELECTION_FALLBACK", "proroot-assets-missing");
     }
     return proot();
+  }
+
+  /** proroot 五个 .so 是否就位；探测结论里没有它（那是资产问题，不是环境能力问题）。 */
+  private boolean prorootUsable() {
+    if (forceProot || android.os.Build.VERSION.SDK_INT < 26) return false;
+    try {
+      return new ContainerRuntime.Proroot(
+              context, ContainerRuntime.Proroot.defaultDir(context), ports.settings().staticLoader)
+          .available();
+    } catch (RuntimeException unavailable) {
+      return false;
+    }
+  }
+
+  /**
+   * 装配 chroot 运行时：落地引导脚本、准备 pid/哨兵/日志路径。
+   *
+   * <p>任何一步失败都返回 {@code null} 而不是抛异常 —— 调用方据此降一档，这与
+   * 「选择由探测决定、失败只做有界兜底」是同一条思路。
+   */
+  private ContainerRuntime chroot(ChrootProbe.Result probe) {
+    try {
+      ChrootHostScripts.Installed installed = ChrootHostScripts.prepare(context);
+      ChrootHostScripts.verify(context, installed);
+      File base = new File(context.getFilesDir(), "chroot");
+      if (!base.isDirectory() && !base.mkdirs()) throw new IOException("CHROOT_STATE_DIRECTORY");
+      int uid = android.os.Process.myUid();
+      return new ContainerRuntime.Chroot(
+          context,
+          installed.directory(),
+          installed.script("host-launch.sh"),
+          uid,
+          uid,
+          new File(base, "web.pid"),
+          new File(base, "web.stopped"),
+          new File(base, "guest-env.sh"),
+          new File(base, "guest.log"),
+          new File(base, "ready"));
+    } catch (IOException | RuntimeException failure) {
+      ports.record(
+          "RUNTIME_SELECTION_FALLBACK",
+          "chroot:" + SensitiveData.redact(failure.getClass().getSimpleName()));
+      return null;
+    }
   }
 
   ContainerRuntime proot() {

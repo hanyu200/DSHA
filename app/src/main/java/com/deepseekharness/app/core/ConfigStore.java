@@ -272,7 +272,14 @@ public class ConfigStore {
   }
 
   static boolean preferFastColdModeFrom(java.util.Map<String, ?> values) {
-    return !values.containsKey(Constants.KEY_CONTAINER_RUNTIME)
+    // 键不存在、或存的是 "auto" / "proot"，都表示「用户没要求更快的档位」——新增 chroot 之后
+    // proroot 不再是唯一的快档，所以旧默认值 "proot" 也算未选择（语义变化，见本轮 CHANGELOG）。
+    // 显式选了 proroot / chroot 必须尊重；类型损坏（false / 1 之类）按保守处理，不擅自换档。
+    String choice =
+        com.deepseekharness.app.util.PreferenceValue.text(
+            values.get(Constants.KEY_CONTAINER_RUNTIME), "auto");
+    boolean unselected = "auto".equals(choice) || "proot".equals(choice);
+    return unselected
         && !values.containsKey("cold_runtime_root")
         && !values.containsKey("cold_runtime_packages")
         && !values.containsKey("cold_runtime_mode");
@@ -360,17 +367,34 @@ public class ConfigStore {
 
   static com.deepseekharness.app.runtime.RuntimeHostPorts.Settings runtimeSettingsFrom(
       java.util.Map<String, ?> values) {
+    String choice =
+        com.deepseekharness.app.util.PreferenceValue.text(
+            values.get(Constants.KEY_CONTAINER_RUNTIME), "auto");
     return new com.deepseekharness.app.runtime.RuntimeHostPorts.Settings(
         com.deepseekharness.app.util.ResolverConfig.mode(
             com.deepseekharness.app.util.PreferenceValue.text(values.get("dns_mode"), "auto")),
-        "proroot"
-            .equals(
-                com.deepseekharness.app.util.PreferenceValue.text(
-                    values.get(Constants.KEY_CONTAINER_RUNTIME), "proot")),
+        // 历史布尔字段只服务冷安装的「已确认成功方式」核验，语义保持原样。
+        "proroot".equals(choice),
         com.deepseekharness.app.util.PreferenceValue.flag(
             values.get("proroot_static_loader"), true),
         com.deepseekharness.app.util.PreferenceValue.flag(
-            values.get("proot_disable_seccomp"), false));
+            values.get("proot_disable_seccomp"), false),
+        choice);
+  }
+
+  /** 运行时偏好（auto / chroot / proroot / proot）；未知值一律回落 auto。 */
+  public com.deepseekharness.app.util.RuntimeSelection.Mode runtimeMode() {
+    return com.deepseekharness.app.util.RuntimeSelection.Mode.parse(
+        text(Constants.KEY_CONTAINER_RUNTIME, "auto"));
+  }
+
+  public void setRuntimeMode(com.deepseekharness.app.util.RuntimeSelection.Mode mode) {
+    prefs
+        .edit()
+        .putString(
+            Constants.KEY_CONTAINER_RUNTIME,
+            (mode == null ? com.deepseekharness.app.util.RuntimeSelection.Mode.AUTO : mode).stored())
+        .apply();
   }
 
   public boolean isLanMode() {

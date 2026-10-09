@@ -222,6 +222,36 @@ public final class ChrootProbe {
   }
 
   // ==================================================================
+  // 结论保鲜
+
+  /** 结论超过这么久就当过期：内核、rootfs、su 授权都可能在这期间变过。 */
+  public static final long MAX_AGE_MILLIS = 30L * 24 * 60 * 60 * 1000;
+
+  /** 单份报告的大小上限；超过就当读不动，避免把畸形文件整个读进内存。 */
+  public static final int MAX_REPORT_BYTES = 256 * 1024;
+
+  /**
+   * 结论是否可信：可读、带时间戳、未过期、也没有来自「未来」的时间戳
+   * （时钟被改过或文件被换过，两种都不该当作有效结论）。
+   */
+  public static boolean trusted(Result result, long nowMillis) {
+    if (result == null || !result.readable()) return false;
+    long at = result.atMillis();
+    if (at <= 0 || at > nowMillis) return false;
+    return nowMillis - at <= MAX_AGE_MILLIS;
+  }
+
+  /** 需不需要重跑探测（从来没跑过 / 结论过期 / 时间戳不可信）。冷启动据此提示用户。 */
+  public static boolean shouldReprobe(Result result, long nowMillis) {
+    return !trusted(result, nowMillis);
+  }
+
+  /** 从报告文本判定「是否可信」，供只需要布尔结论的调用方用，免去自己管时间戳。 */
+  public static boolean trustedText(String report, long atMillis, long nowMillis) {
+    return trusted(parse(report, atMillis), nowMillis);
+  }
+
+  // ==================================================================
   // 导出
 
   /** 给人看的文本报告（设置页「运行环境探测」+ 诊断附件）。 */
