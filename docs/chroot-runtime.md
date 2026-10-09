@@ -5,6 +5,9 @@
 > `0.2.21-20261009.0750-dsh0.2.0-rc.2` / 内置 dsh `0.2.0-rc.2`）
 > 分支：`feat/chroot-runtime`　实施依据：《DSHA 三运行时 Fork 实施方案》v1.3
 > 本报告日期：2026-10-09
+>
+> **进度**：阶段 0 ✅ ｜ 阶段 0.5 ✅（真机实测，见 §三）｜ 阶段 1 ✅ ｜ 阶段 2 部分完成
+> （§3.2 的降权机制修正待应用）｜ 阶段 3 待真实 APK
 
 ## 一、目标与范围
 
@@ -26,7 +29,79 @@
 | §2.2「把 `ContainerRuntime.BINDS` 逐条转 `mount --bind`」 | 不能照抄：`/proc/self/fd` 是符号链接、`/dev/urandom → /dev/random` 是文件绑定、`/dev/pts` 与 `/dev` 绑定重复 |
 | §1.1「两个 flavor」 | 正确（`standard` / `low`），本报告未改动 flavor |
 
-## 三、实现清单
+## 三、阶段 0.5 真机实测结论
+
+**设备**：小米 2206122SC（`unicorn`）/ Android 17（SDK 37）/ KernelSU，SELinux `Enforcing`。
+**方法**：`docs/chroot-stage0-smoke.sh` + `docs/chroot-stage0-probe-drop.sh` +
+`docs/chroot-stage0-probe-extra.sh`；全部可复现，清理脚本 `docs/chroot-stage0-cleanup.sh`。
+**取证方式**：经 adb 无线/有线调试直接执行，输出见各脚本的 `*-result.txt`。
+
+### 3.1 硬判据
+
+| 判据 | 结果 | 原始证据 |
+|---|---|---|
+| root | **通过** | `uid=0(root) context=u:r:ksu:s0`；KernelSU 已预授权，`su -c` 无需弹窗 |
+| mount ns | **通过** | `unshare -m true` → exit 0 |
+| chroot | **通过** | `chroot <rootfs> /bin/sh` 内 `uid=0`，且宿主 `/data/adb` 报 `No such file or directory`（证明真的换了根） |
+| 降权 | **通过，但机制与计划不同** | `before uid=0 gid=0 pid=5771` → `AFTER uid=2000 gid=2000 pid=5771`（`setuidgid` 原地 exec，pid 不变） |
+| PID ns | **不可建** | `unshare -mpf true` → `unshare: Invalid argument`（EINVAL） |
+
+### 3.2 计划 §2.2 需要修正的两处
+
+**① `setpriv --reuid=<AppUid> --regid=<AppGid> --clear-groups` 在 Android 上不可用。**
+
+实测盘查结果：
+
+- Android toybox（0.8.13-android）**根本没有 `setpriv`**，其子命令里与容器相关的只有
+  `chroot mount nsenter setsid umount unshare`；
+- KernelSU 自带的 busybox 1.36.1.1 **有 `setpriv`，但它是裁剪版**：帮助文本只有
+  `-d/--dump`、`--nnp`、`--inh-caps`、`--ambient-caps` —— **只能调 capability，不能改 UID**。
+  实测 `setpriv --reuid=2000 …` 直接报 `unrecognized option '--reuid=2000'`。
+
+**可用替代：busybox `setuidgid <uid>`**（实测通过）。要点：
+
+- 原地 `exec` 降权，**pid 不变** —— 这对「pid 文件 + 出生身份核验」的停止链路是必需的；
+- busybox 是**随包资产**，不依赖 KernelSU/Magisk 专有路径，可移植性优于 `su <uid> -c`；
+- 备选路径 `su <uid> -c …` 实测也有效（`su 2000 -c id` → `uid=2000(shell) ctx=u:r:ksu:s0`），
+  但它只在有 KernelSU/Magisk 的设备上存在，且多一层 su 语义，作为回落而非首选。
+
+**② PID ns 从「暂定关闭」升级为「永远关闭」。**
+
+`unshare` 工具本身支持 `-p`，但内核/策略在该机型上拒绝创建 PID namespace（EINVAL）。
+这与计划 §2.2「默认值由阶段 0.5 冒烟结论决定，暂定关闭」的结论一致，且不再需要冒烟
+回收测试 —— 既然建不出来，孤儿回收方案也就无从谈起。
+
+### 3.3 安全模型新增事实：降权不换域
+
+实测 `su 2000 -c` 与 `chroot` 内 `setuidgid 2000` 之后，SELinux 上下文**仍是 `u:r:ksu:s0`**：
+
+| 阶段 | uid | SELinux 域 |
+|---|---|---|
+| 宿主 root | 0 | `u:r:ksu:s0` |
+| chroot 内 | 0 | `u:r:ksu:s0` |
+| chroot 内降权后 | 2000 | `u:r:ksu:s0` |
+| 上游 proot 下的 Web（对照） | 应用 UID | 应用域（`untrusted_app*`） |
+
+两点直接推论：
+
+1. **权限面比上游宽**：chroot 内的 dsh 是「应用 UID + `ksu` 域」，而不是「应用 UID + 应用域」。
+   计划 §5 已经预判到这个差异并要求如实记录 —— 现在有了确切证据（域是 `ksu`，不是计划里
+   假设的 `su`）。
+2. **停止链路不能依赖应用直接发信号**：应用是 `untrusted_app` 域，与 `ksu` 域之间没有
+   通用的 signal 授权保证。因此"哨兵文件 + 特权监护进程"不是可选项，而是**必需设计**：
+   应用只写自己私有目录里的哨兵（自己的域，必然允许），监护进程（`ksu` 域）轮询到之后
+   对 guest 发 TERM。`host-launch.sh` 里已经是这个设计。
+
+### 3.4 仍然未知、需要真机 APK 才能验的
+
+| 项 | 为什么现在验不了 |
+|---|---|
+| 应用（`untrusted_app`）能否读到 `ksu` 域 guest 的 `/proc/<pid>/stat` 与 `cmdline` | 需要真实应用上下文的进程；shell/root 都测不出 |
+| 降权后可写性（rootfs 内 `/root`、`/root/.dsh`） | 依赖 DSHA 真实 rootfs 的属主/fakeroot 语义，本机没有该 rootfs |
+| `runcon` 降域可行性（`u:r:untrusted_app:s0`） | toybox 与 busybox 都带 `runcon`，但能否转移取决于机型 sepolicy，需要真实域组合 |
+| 16K 页设备上的 ELF 对齐 | 本机 `PAGESIZE` 非 16K |
+
+## 四、实现清单
 
 ### 新增（纯逻辑，`util/`，全部配单测）
 
@@ -83,33 +158,43 @@ WebProcSelTest WebProcSelChrootTest ConfigStoreRuntimeSettingsTest ColdRuntimeSe
 - `ConfigFragment.java` UI 改动做 `javac -proc:only` 解析检查（clean）；**未做完整编译**
   （见下）。
 
-### 本机未能验证的部分（如实声明，不得当作通过）
+### 未能在本机验证的部分（如实声明，不得当作通过）
 
 | 项 | 原因 |
 |---|---|
 | Gradle 全量单测 / Release Lint / APK 打包 | 缺 `offline-rootfs.bin`（Ubuntu arm64 userland 只能在 Linux 上 debootstrap）；本机亦无 NDK 26.3.11579264 |
 | `runtime-descriptor.json` 重新生成 | 同一原因：生成器要求 `asset_paths()` 包含 `offline-rootfs.bin`。**因此 `verifyRuntimeDescriptorInputs` 当前为红**（`DESCRIPTOR_LAUNCHER_MEMBER_SET`），因为 `launcherSources` 里的 `util/WebProcSel.java` 与 `core/ConfigStore.java` 摘要已变。发布前必须在有 Linux 环境的机器上跑 `tools/prepare-runtime-descriptor.py --write` 并提交该产物，否则门禁失败 |
 | `ubuntu-tools.bin` | 锁文件里 28 个 deb 有 **13 个**已被 Ubuntu 从 `ports.ubuntu.com` 撤下（`curl` / `openssl` / `perl` 等被更新版本取代），固定版本不再可下载。需要重跑 `tools/prepare-ubuntu-tools.py` 的取锁流程，或改用 snapshot 镜像 —— 属上游维护问题，非本 fork 引入 |
-| 真机链路（阶段 0.5 / 阶段 3） | 由用户在设备上按 `docs/chroot-stage0-smoke.sh` + 验收清单执行 |
+| 真机链路（阶段 3 验收） | 需要装好 fork 的 APK；见 §3.4 的未知项 |
 
-## 五、设计上的两处刻意选择
+### 已在真机验证的部分
 
-1. **PID ns 在 v1 内不实现**。监护进程不能是另一个 PID namespace 的 PID 1（内核特殊对待，
-   且它退出会连带杀掉整个 ns），而把 guest 单独放进 ns 又会让 pid 文件同时存在「宿主可见 pid」
-   与「ns 内 pid」两个语义。计划 §2.2 要求的「先有经测试的 subreaper 方案再开」就是这个意思。
-   `host-launch.sh` 收到 `DSHA_CHROOT_PIDNS=1` 时会明确说明并降级为关闭，`ChrootProbe`
-   也只在**可建且回收实测通过**时才建议开启。
-2. **监护进程先降回应用 UID 再写 pid 文件**。这是让「停止」不需要 `su -c kill` 的关键：
-   降权后宿主与它同 UID，`WebProcessManager` 那套「pid 文件 + `/proc/<pid>/stat` 出生身份
-   核验」原样可用；留在 root 则既杀不动、pid 文件也读不了。
+见 §三（阶段 0.5）。chroot 的四项硬判据全部通过，降权机制由 `setpriv` 改为 `setuidgid`。
+
+## 五、设计上的刻意选择
+
+1. **PID ns 不实现**（实测已确认永远不可用，见 §3.2）。监护进程不能是另一个 PID namespace
+   的 PID 1（内核特殊对待，且它退出会连带杀掉整个 ns），而把 guest 单独放进 ns 又会让 pid 文件
+   同时存在「宿主可见 pid」与「ns 内 pid」两个语义；更何况该机型直接拒绝创建 PID ns。
+   `host-launch.sh` 收到 `DSHA_CHROOT_PIDNS=1` 时会明确说明并降级为关闭。
+2. **监护进程先降到应用 UID 再写 pid 文件**。这样 pid 文件归应用所有、可被应用读取，
+   `/proc/<pid>/stat` 的出生身份也能被应用核验；留在 root 则两件事都不成立。
+3. **停止走哨兵而不是应用发信号**（实测后从「偏好」变成「必需」，见 §3.3）。
+   应用只写自己私有目录里的哨兵文件（自己的域，必然允许写），监护进程轮询到之后对 guest
+   发 TERM，超时 KILL。这条路径不依赖任何跨域授权。
 
 ## 六、未决问题
 
 1. `runtime-descriptor.json` 需在有 Linux 环境的机器上重新生成后提交（见上表）。
 2. `ubuntu-tools.bin` 的 13 个固定版本 deb 已被上游撤下，需要重新取锁或改镜像。
-3. 阶段 0.5 结论（`setpriv` 是否存在 / PID ns 回收 / 降权后可写性 / su 的 SELinux 域）
-   决定：是否需要随包静态 toybox、是否评估降域、rootfs 属主是否需要调整。
-4. SELinux 域差异（应用 UID + su 域）需在阶段 2/3 评估降域可行性，受机型 sepolicy 限制；
-   默认保持并已在 CHANGELOG 与本报告中如实记录。
-5. `RuntimeTrial` / 冷安装仍走 proot（与计划 §2.3 一致）；chroot 目前只服务日常启动链，
+3. **busybox 的来源**：降权改用 `setuidgid` 之后，host-launch.sh 需要一个可用的 busybox。
+   首选方案是随包静态 busybox（0BSD，约 1–2MB，与计划 §2.2「静态 toybox 兜底」同一考虑），
+   回落方案是探测宿主已有的 busybox（KernelSU/Magisk 的 `/data/adb/*/bin/busybox`）。
+   这需要按「新增 ELF 过 16K 对齐检查」的要求走一遍，属待办。
+4. 降权后可写性（rootfs 内 `/root`、`/root/.dsh`）与「应用能否读 `ksu` 域进程的 `/proc`」
+   需真实 APK 才能验（见 §3.4）。
+5. SELinux 域差异（应用 UID + `ksu` 域）需在阶段 3 评估降域可行性，受机型 sepolicy 限制；
+   默认保持并已如实记录。
+6. `RuntimeTrial` / 冷安装仍走 proot（与计划 §2.3 一致）；chroot 目前只服务日常启动链，
    受管更新路径的 chroot 化留给阶段 4。
+

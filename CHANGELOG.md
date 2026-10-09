@@ -29,10 +29,19 @@
 - **语义变化**（冷安装）：新增 chroot 后 proroot 不再是唯一的快档，因此冷安装的
   `preferFastColdModeFrom` 现在把旧默认值 `proot` 与新的 `auto` 同等看待（都表示「用户没
   要求更快的档」）；`proroot` / `chroot` 与类型损坏的值仍然阻止自动换档。
-- **已知权限差异**：`setpriv` 只改 UID/GID、不改 SELinux 上下文，chroot 内 dsh 会以
-  应用 UID + su 域运行，权限面比上游的 app 域宽；这是如实记录的差异，不宣称「安全隔离」。
-- **未完成/未验证**：PID ns 在 v1 内不实现（见报告说明）；真机链路（chroot 起 Web、
-  原生模块、PTY、备份、运行时双向切换）需在设备上按验收清单执行，本机无法代跑。
+- **已知权限差异**：降权只改 UID/GID、**不改 SELinux 上下文**，chroot 内 dsh 会以
+  应用 UID + KernelSU 域（实测 `u:r:ksu:s0`）运行，权限面比上游的 app 域宽；这是如实记录的
+  差异，不宣称「安全隔离」。因此「停止」不依赖应用直接发信号，而是「哨兵文件 + 特权监护
+  进程」——这条已由实测从「设计偏好」升级为「必需」（跨域 signal 无授权保证）。
+- **阶段 0.5 真机实测结论**（小米 2206122SC / Android 17 / KernelSU）：root、mount ns、
+  chroot、降权四项硬判据**全部通过**；PID namespace **内核拒绝创建**（`unshare -mpf` →
+  EINVAL），故「暂定关闭」升级为「永远关闭」。详见[实施与验证报告](docs/chroot-runtime.md) §三。
+- **修正计划 §2.2 的一处错误假设**：`setpriv --reuid/--regid/--clear-groups` 在 Android 上
+  不可用 —— toybox 没有 `setpriv`，KernelSU busybox 的 `setpriv` 是只调 capability 的裁剪版
+  （实测报 `unrecognized option '--reuid'`）。降权改用 busybox **`setuidgid <uid>`**：实测
+  原地 exec 降权、pid 不变，且 busybox 作为随包资产可移植性优于 `su <uid> -c`。
+- **未完成/未验证**：真机链路（chroot 起 Web、原生模块、PTY、备份、运行时双向切换）需在
+  设备上按验收清单执行；降权后可写性与「应用能否读 ksu 域进程的 /proc」需真实 APK 才能验。
   受管更新（`RuntimeTrial` / 冷安装）仍走 proot，与上游一致。
 
 ## 0.2.7-20261003.1944-dsh0.2.0-rc.2 / 156（2026-10-03，本地修订）
