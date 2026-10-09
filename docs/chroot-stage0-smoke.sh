@@ -34,8 +34,9 @@
 
 set -u
 
-CHROOT_DIR="${DSHA_CHROOT_DIR:-/data/data/com.dsh.client/files/linux/ubuntu}"
 APP_PKG="${DSHA_CHROOT_PKG:-com.dsh.client}"
+# rootfs 路径：显式给了就用；没给就先探测常见位置（见 resolve_rootfs）。
+CHROOT_DIR="${DSHA_CHROOT_DIR:-}"
 # 报告默认写到应用私有目录：root 与 app UID 都能读写，设置页「运行环境探测」直接读这份。
 # /data/local/tmp 在部分机型上 app 域读不到（SELinux），要手工 cp 出来才看得到。
 OUT_DIR="${DSHA_CHROOT_OUT:-/data/data/${DSHA_CHROOT_PKG:-com.dsh.client}/files/chroot-probe}"
@@ -47,6 +48,28 @@ PID_NS="${DSHA_CHROOT_PIDNS:-0}"
 R="$CHROOT_DIR"
 NS_PID=""
 MOUNTS_MADE=""
+
+# 找 rootfs：优先用显式路径，否则按可能性从高到低试几个已知位置。
+# 为什么要探测而不是写死一个：「/data/data/<pkg>」在部分 ROM 上是到 /data/user/0 的符号链接，
+# 行为不一；直接写死一个路径会在真机上以「rootfs 不存在」收场，而那不是真的不存在。
+resolve_rootfs() {
+  if [ -n "$R" ]; then
+    return 0
+  fi
+  for candidate in \
+    "/data/user/0/$APP_PKG/files/linux/ubuntu" \
+    "/data/data/$APP_PKG/files/linux/ubuntu" \
+    "/data/user_de/0/$APP_PKG/files/linux/ubuntu"; do
+    if [ -d "$candidate/bin" ]; then
+      R="$candidate"
+      return 0
+    fi
+  done
+  # 都不在时保留第一个候选作为报错文案里的路径，便于用户对照。
+  R="/data/user/0/$APP_PKG/files/linux/ubuntu"
+  return 1
+}
+
 
 # ---------------------------------------------------------------- 记录工具
 
@@ -107,11 +130,34 @@ json_end() {
 # ---------------------------------------------------------------- 前置
 
 preflight() {
+  # 先确认 rootfs 在不在，**再**建输出目录。
+  # 顺序很重要：早期版本先 mkdir 后检查，于是在没装 DSHA 的设备上留下了一个空的
+  # /data/data/<pkg>/files/chroot-probe 目录 —— pm 不认识它，用户也删不掉（得用 root）。
+  # 探测失败就不该在设备上留下任何痕迹。
+  #
+  # 注意这一段**不能**用 log()/section()：它们写 $REPORT，而报告文件此刻还不该存在。
+  # 直接打 stdout/stderr。
+  printf '%s\n' "==== DSHA chroot 阶段 0.5 冒烟 ===="
+  printf '%s\n' "设备: $(getprop ro.product.model 2>/dev/null) / Android $(getprop ro.build.version.release 2>/dev/null) / SDK $(getprop ro.build.version.sdk 2>/dev/null)"
+
+  if ! resolve_rootfs; then
+    printf '%s\n' "!! rootfs 不存在：$R"
+    printf '%s\n' "   已试过："
+    printf '%s\n' "     /data/user/0/$APP_PKG/files/linux/ubuntu"
+    printf '%s\n' "     /data/data/$APP_PKG/files/linux/ubuntu"
+    printf '%s\n' "     /data/user_de/0/$APP_PKG/files/linux/ubuntu"
+    printf '%s\n' "   请确认 DSHA 已装好环境（设置 → 安装与修复 → 完整安装），"
+    printf '%s\n' "   或用 DSHA_CHROOT_DIR 指到别的 rootfs，用 DSHA_CHROOT_PKG 改包名。"
+    printf '%s\n' "   未创建报告目录（探测失败不留痕迹）。"
+    exit 2
+  fi
+
   mkdir -p "$OUT_DIR" 2>/dev/null
   : >"$REPORT"
   json_start
 
   section "0. 身份与 SELinux 上下文"
+  log "rootfs: $R"
   run "whoami 身份" id
   run "SELinux 当前上下文 attr/current" cat /proc/self/attr/current
   run "SELinux 当前上下文 id -Z" id -Z
@@ -121,29 +167,37 @@ preflight() {
   kv "fact.selinux_before" "$(cat /proc/self/attr/current 2>/dev/null)"
 
   section "1. rootfs 身份"
-  if [ -d "$R" ]; then
-    log "rootfs 存在：$R"
-    run "rootfs 属主" stat -c '%u:%g %a %n' "$R"
-    run "rootfs 顶层" ls -la "$R"
-    run "/bin/bash 是否就位" ls -l "$R/bin/bash"
-    run "bash ELF" sh -c "head -c 4 '$R/bin/bash' | od -An -tx1"
-    run "loader 路径" sh -c "ls -l '$R/lib/ld-linux-aarch64.so.1' 2>&1 || ls -l '$R/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1'"
-    jrec "rootfsPresent" "yes"
-  else
-    log "!! rootfs 不存在：$R"
-    log "   请确认 DSHA 已装好环境（设置 → 安装与修复 → 完整安装），或用 DSHA_CHROOT_DIR 指到别的 rootfs"
-    jrec "rootfsPresent" "no"
-    json_end
-    exit 2
-  fi
+  log "rootfs 存在：$R"
+  run "rootfs 属主" stat -c '%u:%g %a %n' "$R"
+  run "rootfs 顶层" ls -la "$R"
+  run "/bin/bash 是否就位" ls -l "$R/bin/bash"
+  run "bash ELF" sh -c "head -c 4 '$R/bin/bash' | od -An -tx1"
+  run "loader 路径" sh -c "ls -l '$R/lib/ld-linux-aarch64.so.1' 2>&1 || ls -l '$R/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1'"
+  jrec "rootfsPresent" "yes"
 
-  APP_UID="$(stat -c '%u' /data/data/$APP_PKG 2>/dev/null)"
-  APP_GID="$(stat -c '%g' /data/data/$APP_PKG 2>/dev/null)"
-  [ -n "$APP_UID" ] || APP_UID="$(stat -c '%u' "$(dirname "$(dirname "$R")")" 2>/dev/null)"
+  # 应用 UID：优先按包名查（/data/user/0 与 /data/data 同 inode，任一都行）。
+  APP_UID=""
+  for dir in "/data/user/0/$APP_PKG" "/data/data/$APP_PKG"; do
+    [ -n "$APP_UID" ] && break
+    APP_UID="$(stat -c '%u' "$dir" 2>/dev/null)"
+  done
+  APP_GID="$(stat -c '%g' "/data/user/0/$APP_PKG" 2>/dev/null)"
   [ -n "$APP_GID" ] || APP_GID="$APP_UID"
-  log "应用 UID:GID = ${APP_UID:-?}:${APP_GID:-?}"
-  jrec "appUid" "${APP_UID:-?}"
-  kv "fact.app_uid" "${APP_UID:-?}"
+  # 兜底：从 rootfs 往上两级推（files/linux/ubuntu → files）。
+  if [ -z "$APP_UID" ] || [ "$APP_UID" = "0" ]; then
+    derived="$(stat -c '%u' "$(dirname "$(dirname "$(dirname "$R")")")" 2>/dev/null)"
+    case "$derived" in ''|0|*[!0-9]*) ;; *) APP_UID="$derived"; APP_GID="$derived" ;; esac
+  fi
+  if [ -z "$APP_UID" ] || [ "$APP_UID" = "0" ]; then
+    log "!! 无法确定应用 UID（得到 '${APP_UID:-空}'）—— 降权测试会失去意义"
+    log "   请确认包装在且包名正确，或显式给出：DSHA_CHROOT_PKG=<包名>"
+    kv "fact.app_uid" "unknown"
+    jrec "appUid" "unknown"
+  else
+    log "应用 UID:GID = $APP_UID:$APP_GID"
+    kv "fact.app_uid" "$APP_UID"
+    jrec "appUid" "$APP_UID"
+  fi
   printf '%s\n' "${APP_UID:-}" >"$STATE.uid"
   printf '%s\n' "${APP_GID:-}" >"$STATE.gid"
 }
@@ -174,17 +228,61 @@ emit_checks() {
   fi
   kv "check.chroot" "$chroot_ok"
 
-  # (d) setpriv：没有它就只能以 root 跑 dsh，宿主停止链路整条失效 —— 见 §2.2
-  if command -v setpriv >/dev/null 2>&1; then
-    setpriv --reuid="${APP_UID:-0}" --regid="${APP_GID:-0}" --clear-groups true >/dev/null 2>&1
-    if [ $? -eq 0 ]; then kv "check.setpriv" "yes"; else kv "check.setpriv" "no"; fi
-  else
-    kv "check.setpriv" "no"
+  # (d) 降权能力。
+  #
+  # 实测结论（2026-10-09，小米 2206122SC / Android 17 / KernelSU，见 docs/chroot-runtime.md §3.2）：
+  # plan §2.2 的 `setpriv --reuid/--regid/--clear-groups` 在 Android 上**不可用** ——
+  #   * toybox 没有 setpriv（子命令只有 chroot mount nsenter setsid umount unshare）；
+  #   * KernelSU busybox 的 setpriv 是裁剪版，只有 -d/--nnp/--inh-caps/--ambient-caps，
+  #     实测 `--reuid=2000` 直接报 unrecognized option。
+  # 可用替代是 busybox 的 `setuidgid <uid>`：原地 exec 降权、pid 不变（实测
+  # before uid=0 pid=5771 → AFTER uid=2000 pid=5771）。
+  #
+  # 因此这里判据改成「找一个真能改 UID 的工具」，并且**优先 busybox setuidgid**。
+  # 只认「命令真的把 uid 改掉了」，不认「工具存在」—— setpriv 就是「存在但不能改 UID」的反例。
+  downgrade_ok=no
+  downgrade_tool=""
+  target="${APP_UID:-2000}"
+  case "$target" in ''|0|*[!0-9]*) target=2000 ;; esac
+
+  try_downgrade() {
+    # try_downgrade <工具路径> <子命令…>
+    tool="$1"; shift
+    got="$("$tool" "$@" /system/bin/id -u 2>/dev/null | tr -d ' \n')"
+    if [ "$got" = "$target" ]; then
+      downgrade_ok=yes
+      downgrade_tool="$tool $*"
+      return 0
+    fi
+    return 1
+  }
+
+  BB=""
+  if command -v busybox >/dev/null 2>&1; then BB="$(command -v busybox)"; fi
+  for candidate in \
+    "${BB:+$BB setuidgid}" \
+    "${BB:+$BB setpriv}" \
+    ""; do
+    [ -n "$candidate" ] || continue
+    # shellcheck disable=SC2086
+    if try_downgrade $candidate "$target"; then break; fi
+  done
+  # 备选：KernelSU/Magisk 的 su <uid> -c（实测有效，但不是所有设备都有 su）
+  if [ "$downgrade_ok" = "no" ] && command -v su >/dev/null 2>&1; then
+    got="$(su "$target" -c 'id -u' 2>/dev/null | tr -d ' \n')"
+    if [ "$got" = "$target" ]; then
+      downgrade_ok=yes
+      downgrade_tool="su $target -c"
+    fi
   fi
+
+  kv "check.setpriv" "$downgrade_ok"
+  kv "fact.downgrade_tool" "${downgrade_tool:-none}"
+  kv "fact.downgrade_target" "$target"
 }
 
 probe_tools() {
-  section "2. 宿主工具可用性（决定是否要随包静态 toybox）"
+  section "2. 宿主工具可用性（决定是否要随包静态 toybox / busybox）"
   for t in su unshare nsenter mount umount chroot setpriv toybox busybox id stat getconf node; do
     p="$(command -v "$t" 2>/dev/null)"
     if [ -n "$p" ]; then
