@@ -206,13 +206,28 @@ public class ConfigFragment extends Fragment {
     proroot.setChecked(c.isProroot());
     lan.setChecked(c.isLanMode());
     overlay.setChecked(pref(ctx, "overlay_stream", false));
+    // 运行时四选一：自动（探测决定）/ 强制 chroot / 强制 proroot / 强制 proot。
+    // 选择结果同时写回历史布尔开关 proroot，让冷安装的「已确认成功方式」核验继续可用。
+    java.util.concurrent.atomic.AtomicReference<com.deepseekharness.app.util.RuntimeSelection.Mode>
+        runtimeMode =
+            new java.util.concurrent.atomic.AtomicReference<>(c.runtimeMode());
     bindChoice(
         v,
         R.id.config_runtime_choice,
         com.deepseekharness.app.util.UiText.choose("运行方式", "Runtime"),
-        new String[] {"proroot", "proot"},
-        c.isProroot() ? 0 : 1,
-        index -> proroot.setChecked(index == 0));
+        new String[] {
+          com.deepseekharness.app.util.UiText.choose(
+              "自动（有 root 用 chroot）", "Automatic (chroot when rooted)"),
+          com.deepseekharness.app.util.UiText.choose("强制 chroot", "Force chroot"),
+          "proroot",
+          "proot"
+        },
+        runtimeIndex(c.runtimeMode()),
+        index -> {
+          var selected = runtimeModeAt(index);
+          runtimeMode.set(selected);
+          proroot.setChecked(selected == com.deepseekharness.app.util.RuntimeSelection.Mode.PROROOT);
+        });
     bindChoice(
         v,
         R.id.config_dns_choice,
@@ -317,7 +332,7 @@ public class ConfigFragment extends Fragment {
                   c.setDesktopMode(desktop.isChecked());
                   if (com.deepseekharness.app.BuildConfig.LOW_ANDROID)
                     c.setGeckoCore(gecko.isChecked());
-                  c.setProroot(proroot.isChecked());
+                  c.setRuntimeMode(runtimeMode.get());
                   c.setProrootStaticLoader(staticLoader.isChecked());
                   c.setProotSeccompDisabled(noSeccomp.isChecked());
                   c.setDnsMode(
@@ -480,6 +495,25 @@ public class ConfigFragment extends Fragment {
   private void toast(String s) {
     Context context = getContext();
     if (context != null) Toast.makeText(context, s, Toast.LENGTH_SHORT).show();
+  }
+
+  /** 运行时下拉框的下标 ↔ 档位：顺序必须与上面 labels 数组一致。 */
+  private static int runtimeIndex(com.deepseekharness.app.util.RuntimeSelection.Mode mode) {
+    return switch (mode) {
+      case AUTO -> 0;
+      case CHROOT -> 1;
+      case PROROOT -> 2;
+      case PROOT -> 3;
+    };
+  }
+
+  private static com.deepseekharness.app.util.RuntimeSelection.Mode runtimeModeAt(int index) {
+    return switch (index) {
+      case 1 -> com.deepseekharness.app.util.RuntimeSelection.Mode.CHROOT;
+      case 2 -> com.deepseekharness.app.util.RuntimeSelection.Mode.PROROOT;
+      case 3 -> com.deepseekharness.app.util.RuntimeSelection.Mode.PROOT;
+      default -> com.deepseekharness.app.util.RuntimeSelection.Mode.AUTO;
+    };
   }
 
   private void bindChoice(
