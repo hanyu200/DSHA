@@ -58,6 +58,130 @@ public final class WebProcSel {
   /** 看门狗自己写下的 pid 文件（容器内路径）。 */
   public static final String PID_WATCHDOG = "/root/.dsha-watchdog.pid";
 
+  // ---------------------------------------------------------------- chroot 启动器
+
+  /**
+   * chroot 运行时的宿主脚本名（{@code app/src/main/java/.../runtime/ChrootRuntime} 装配时使用）。
+   *
+   * <p>chroot 与 proot/proroot 有一个本质差别：它不是「一个可执行文件带一堆参数」，而是
+   * <b>一条特权引导链</b>（{@code unshare → mount → chroot → setpriv}）。这条链的父进程以 root
+   * 运行，宿主（app UID）<b>打不到它的信号</b>；而它的 argv 里带着整条待执行命令 —— 也就是说，
+   * 对 {@code dsh web} 的<b>文本</b>匹配会在它身上命中。
+   *
+   * <p>所以这里和「绝不误杀 proot/proroot」是同一条规则：<b>认得出、且永远不当目标</b>。
+   * 区别在于识别判据必须更严 —— 启动器 argv 的形状是固定的，只认完全对得上的那几种，
+   * 不做子串匹配（否则用户自己 {@code grepping chroot} 也会被当成启动器）。
+   */
+  public static final String[] CHROOT_SCRIPTS = {
+    "host-launch.sh", "host-ctl.sh", "host-ns-enter.sh"
+  };
+
+  /**
+   * chroot 脚本的子命令；必须紧跟在脚本路径后面。
+   *
+   * <p>这一项是「认得出」与「不误认」的分界线：{@code cat host-launch.sh}、{@code vim …}、
+   * {@code grep …} 的参数位置也满足「绝对路径 + 已知脚本名」，但它们后面跟的不是子命令。
+   * 加上这一条之后，只有真正按启动器形状调用的进程才会被认出来。
+   */
+  public static final String[] CHROOT_SUBCOMMANDS = {
+    "boot", "start", "stop", "status", "restart", "teardown", "probe"
+  };
+
+  /** 出现在脚本路径之前、允许被跳过的启动前置命令（它们自己不改变 argv 语义）。 */
+  private static final java.util.Set<String> LAUNCH_PREFIXES =
+      java.util.Set.of("unshare", "nsenter", "setsid", "toybox", "busybox");
+
+  /**
+   * 这条命令行是不是<b>本次 chroot 启动链</b>的某一环。
+   *
+   * <p>判据是「形状完全对得上」，不是子串：{@code [前缀命令…] <解释器> <绝对路径>/<已知脚本名>
+   * <已知子命令>}。宁可漏认（退化成「当普通未知进程处理」，那本来也是 fail-closed），
+   * 也不能把用户自己的进程认成启动器。
+   */
+  public static boolean isChrootStarter(String cmdline) {
+    if (cmdline == null || cmdline.isEmpty()) return false;
+    String[] argv = splitCmdline(cmdline);
+    int at = 0;
+    // 跳过 unshare / nsenter 这类前置命令及其选项；选项后面还可能再跟一个前置命令。
+    while (at < argv.length && isLaunchPrefix(basename(argv[at]))) {
+      at++;
+      at = skipOptions(argv, at);
+    }
+    if (at >= argv.length) return false;
+    if (!isShell(basename(argv[at]))) {
+      // 允许直接 exec 脚本本身（内核用 shebang 接管），此时脚本必须是可识别的绝对路径，
+      // 且形状要与解释器分支一致。
+      return isChrootScriptPath(argv[at]) && isStarterTail(argv, at);
+    }
+    return at + 1 < argv.length && isChrootScriptPath(argv[at + 1]) && isStarterTail(argv, at + 1);
+  }
+
+  /** 脚本路径之后必须是已知子命令，且子命令后面只允许跟选项（以及选项的值）。 */
+  private static boolean isStarterTail(String[] argv, int scriptAt) {
+    int subcommandAt = scriptAt + 1;
+    if (subcommandAt >= argv.length || !isChrootSubcommand(argv[subcommandAt])) return false;
+    return skipOptions(argv, subcommandAt + 1) == argv.length;
+  }
+
+  /**
+   * 跳过一段选项，返回第一个非选项元素的下标。
+   *
+   * <p>{@code --long} 后面可能跟一个值（{@code --propagation private}、{@code --pidns 1}），
+   * 而 <b>option-with-value 形式的裸词正是子命令之后不该出现的东西</b> —— 所以只在紧跟在
+   * {@code --} 选项之后时才把一个裸词当值吞掉，别处的裸词一律留着当「形状不对」。
+   */
+  private static int skipOptions(String[] argv, int from) {
+    int at = from;
+    while (at < argv.length) {
+      String argument = argv[at];
+      if (argument.startsWith("--")) {
+        at++;
+        if (at < argv.length && !argv[at].startsWith("-")) at++;
+        continue;
+      }
+      if (argument.startsWith("-") && argument.length() > 1) {
+        at++;
+        continue;
+      }
+      break;
+    }
+    return at;
+  }
+
+  /** 某一个 argv 元素是不是本项目的 chroot 脚本路径（必须是绝对路径 + 已知脚本名）。 */
+  static boolean isChrootScriptPath(String argument) {
+    if (argument == null || argument.isEmpty() || argument.charAt(0) != '/') return false;
+    int slash = argument.lastIndexOf('/');
+    if (slash < 0 || slash == argument.length() - 1) return false;
+    String name = argument.substring(slash + 1);
+    for (String known : CHROOT_SCRIPTS) if (known.equals(name)) return true;
+    return false;
+  }
+
+  private static boolean isChrootSubcommand(String argument) {
+    for (String known : CHROOT_SUBCOMMANDS) if (known.equals(argument)) return true;
+    return false;
+  }
+
+  private static boolean isLaunchPrefix(String executable) {
+    return LAUNCH_PREFIXES.contains(executable);
+  }
+
+  /** 引导链只通过这些解释器拉起脚本；{@code cat}/{@code vim}/{@code grep} 一律不算。 */
+  private static boolean isShell(String executable) {
+    return executable.equals("sh")
+        || executable.equals("ash")
+        || executable.equals("bash")
+        || executable.equals("mksh");
+  }
+
+  /** argv 切分：有 NUL 按 NUL，否则按空白（与其余判据一致）。 */
+  private static String[] splitCmdline(String cmdline) {
+    return cmdline.indexOf('\0') >= 0
+        ? cmdline.split("\u0000")
+        : cmdline.trim().split("\\s+");
+  }
+
   /** PID 文件只接受单个正整数；拒绝 PID 1、进程组及任何 shell 语法。 */
   public static int parsePid(String value) {
     if (value == null || value.length() > 32) return -1;
@@ -85,10 +209,12 @@ public final class WebProcSel {
    */
   public static boolean looksLikeWeb(String cmdline) {
     if (cmdline == null || cmdline.isEmpty()) return false;
+    // chroot 的引导链带着整条待执行命令，文本里必然出现 "dsh web" —— 先排除它，
+    // 与下面排除 proot/proroot 的理由完全相同：它不是目标，是承载目标的那个东西。
+    if (isChrootStarter(cmdline)) return false;
     // proroot 的 bridge 是 guest 可执行程序本身，父进程 libproroot.so 才是启动器。
     // 只接受已知的 Node + dsh web 参数序列，不能因命令中带有 bridge 名称就放行。
-    String[] argv =
-        cmdline.indexOf('\0') >= 0 ? cmdline.split("\u0000") : cmdline.trim().split("\\s+");
+    String[] argv = splitCmdline(cmdline);
     if (argv.length > 0 && basename(argv[0]).equals("libproroot-bridge.so"))
       return isProrootWebPayload(argv) || isProrootManagedWebShell(argv);
     if (argv.length == 0) return false;
@@ -169,8 +295,10 @@ public final class WebProcSel {
   /** 发信号须是直接运行 dsh web 的 Node，不能命中 shell 参数中的文本。 */
   public static boolean maySignalWeb(String cmdline) {
     if (cmdline == null || cmdline.isEmpty()) return false;
-    String[] args =
-        cmdline.indexOf('\0') >= 0 ? cmdline.split("\u0000") : cmdline.trim().split("\\s+");
+    // chroot 启动链以 root 运行：宿主即使认出来也杀不动它，而且它承载着整个环境。
+    // 这里明确说不 —— 「能识别」不等于「可以杀」。
+    if (isChrootStarter(cmdline)) return false;
+    String[] args = splitCmdline(cmdline);
     if (args.length > 0 && basename(args[0]).equals("libproroot-bridge.so"))
       return isProrootWebPayload(args);
     if (args.length < 3 || !isNode(args[0])) return false;
@@ -184,8 +312,9 @@ public final class WebProcSel {
   /** 返回严格直启命令绑定的隔离 profile；普通 Web、shell 包装和伪造参数均为空。 */
   public static String trialProfile(String cmdline) {
     if (cmdline == null || cmdline.isEmpty()) return "";
-    String[] args =
-        cmdline.indexOf('\0') >= 0 ? cmdline.split("\u0000") : cmdline.trim().split("\\s+");
+    // chroot 启动链会带 profile 参数，但它不是「直启 Web」—— 试运行隔离不适用于它。
+    if (isChrootStarter(cmdline)) return "";
+    String[] args = splitCmdline(cmdline);
     int argument;
     if (args.length > 0 && basename(args[0]).equals("libproroot-bridge.so")) {
       if (!isProrootWebPayload(args)) return "";
